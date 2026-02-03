@@ -15,10 +15,10 @@ class GpuVanity {
   const std::string& error() const;
   size_t max_batch() const;
 
-  bool generate(size_t count, uint8_t* seeds_out, uint8_t* pubkeys_out, uint8_t* hashes_out);
+  bool generate(size_t count, const uint8_t* seeds_in, uint8_t* pubkeys_out,
+                uint8_t* hashes_out);
 
  private:
-  void* states_;
   uint8_t* d_seeds_;
   uint8_t* d_pubkeys_;
   uint8_t* d_hashes_;

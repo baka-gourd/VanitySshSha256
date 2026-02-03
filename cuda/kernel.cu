@@ -1,9 +1,6 @@
 #include "gpu_vanity.h"
 
 #include <cuda_runtime.h>
-#include <curand_kernel.h>
-
-#include <random>
 #include <string>
 
 #include "ed25519.h"
@@ -134,15 +131,7 @@ __device__ void sha256_51(const uint8_t* payload, uint8_t* out) {
   }
 }
 
-__global__ void vanity_init(curandState* states, uint64_t seed, size_t count) {
-  size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (idx < count) {
-    curand_init(seed, static_cast<unsigned long long>(idx), 0, &states[idx]);
-  }
-}
-
-__global__ void vanity_generate(curandState* states,
-                               uint8_t* seeds,
+__global__ void vanity_generate(const uint8_t* seeds,
                                uint8_t* pubkeys,
                                uint8_t* hashes,
                                size_t count) {
@@ -151,16 +140,9 @@ __global__ void vanity_generate(curandState* states,
     return;
   }
 
-  curandState local = states[idx];
-  uint8_t seed[kSeedSize];
+  const uint8_t* seed = seeds + idx * kSeedSize;
   uint8_t pub[kPubKeySize];
   uint8_t priv[64];
-
-  uint32_t* seed32 = reinterpret_cast<uint32_t*>(seed);
-#pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    seed32[i] = curand(&local);
-  }
 
   ed25519_create_keypair(pub, priv, seed);
 
@@ -193,11 +175,8 @@ __global__ void vanity_generate(curandState* states,
 
 #pragma unroll
   for (int i = 0; i < 32; ++i) {
-    seeds[idx * kSeedSize + i] = seed[i];
     pubkeys[idx * kPubKeySize + i] = pub[i];
   }
-
-  states[idx] = local;
 }
 
 bool set_error(std::string* error, const char* prefix, cudaError_t code) {
@@ -216,8 +195,7 @@ bool set_error(std::string* error, const char* prefix, cudaError_t code) {
 namespace vanity {
 
 GpuVanity::GpuVanity(size_t max_batch)
-    : states_(nullptr),
-      d_seeds_(nullptr),
+    : d_seeds_(nullptr),
       d_pubkeys_(nullptr),
       d_hashes_(nullptr),
       capacity_(max_batch),
@@ -244,11 +222,6 @@ GpuVanity::GpuVanity(size_t max_batch)
     return;
   }
 
-  if (set_error(&error_, "cudaMalloc states",
-                cudaMalloc(&states_, capacity_ * sizeof(curandState)))) {
-    ok_ = false;
-    return;
-  }
   if (set_error(&error_, "cudaMalloc seeds",
                 cudaMalloc(&d_seeds_, capacity_ * kSeedSize))) {
     ok_ = false;
@@ -264,22 +237,6 @@ GpuVanity::GpuVanity(size_t max_batch)
     ok_ = false;
     return;
   }
-
-  std::random_device rd;
-  uint64_t seed = (static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd());
-  dim3 block(256);
-  dim3 grid(static_cast<unsigned int>((capacity_ + block.x - 1) / block.x));
-  vanity_init<<<grid, block>>>(static_cast<curandState*>(states_), seed, capacity_);
-  cudaError_t err = cudaGetLastError();
-  if (set_error(&error_, "vanity_init launch", err)) {
-    ok_ = false;
-    return;
-  }
-  err = cudaDeviceSynchronize();
-  if (set_error(&error_, "vanity_init sync", err)) {
-    ok_ = false;
-    return;
-  }
 }
 
 GpuVanity::~GpuVanity() {
@@ -291,9 +248,6 @@ GpuVanity::~GpuVanity() {
   }
   if (d_seeds_) {
     cudaFree(d_seeds_);
-  }
-  if (states_) {
-    cudaFree(states_);
   }
 }
 
@@ -309,7 +263,7 @@ size_t GpuVanity::max_batch() const {
   return capacity_;
 }
 
-bool GpuVanity::generate(size_t count, uint8_t* seeds_out, uint8_t* pubkeys_out,
+bool GpuVanity::generate(size_t count, const uint8_t* seeds_in, uint8_t* pubkeys_out,
                          uint8_t* hashes_out) {
   if (!ok_) {
     return false;
@@ -322,8 +276,15 @@ bool GpuVanity::generate(size_t count, uint8_t* seeds_out, uint8_t* pubkeys_out,
 
   dim3 block(256);
   dim3 grid(static_cast<unsigned int>((count + block.x - 1) / block.x));
-  vanity_generate<<<grid, block>>>(static_cast<curandState*>(states_), d_seeds_,
-                                   d_pubkeys_, d_hashes_, count);
+
+  if (set_error(&error_, "copy seeds",
+                cudaMemcpy(d_seeds_, seeds_in, count * kSeedSize,
+                           cudaMemcpyHostToDevice))) {
+    ok_ = false;
+    return false;
+  }
+
+  vanity_generate<<<grid, block>>>(d_seeds_, d_pubkeys_, d_hashes_, count);
   cudaError_t err = cudaGetLastError();
   if (set_error(&error_, "vanity_generate launch", err)) {
     ok_ = false;
@@ -335,12 +296,6 @@ bool GpuVanity::generate(size_t count, uint8_t* seeds_out, uint8_t* pubkeys_out,
     return false;
   }
 
-  if (set_error(&error_, "copy seeds",
-                cudaMemcpy(seeds_out, d_seeds_, count * kSeedSize,
-                           cudaMemcpyDeviceToHost))) {
-    ok_ = false;
-    return false;
-  }
   if (set_error(&error_, "copy pubkeys",
                 cudaMemcpy(pubkeys_out, d_pubkeys_, count * kPubKeySize,
                            cudaMemcpyDeviceToHost))) {

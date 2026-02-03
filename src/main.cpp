@@ -277,11 +277,9 @@ int main(int argc, char** argv) {
     options.threads = std::max<size_t>(1, std::thread::hardware_concurrency());
   }
 
-  if (options.cpu_only) {
-    if (sodium_init() < 0) {
-      std::cerr << "libsodium init failed\n";
-      return 1;
-    }
+  if (sodium_init() < 0) {
+    std::cerr << "libsodium init failed\n";
+    return 1;
   }
 
   MatchRule rule(options.pattern);
@@ -463,6 +461,7 @@ int main(int argc, char** argv) {
       free_batches.pop_front();
     }
 
+    randombytes_buf(batch->seeds.data(), batch->seeds.size());
     if (!gpu->generate(options.batch, batch->seeds.data(), batch->pubkeys.data(),
                        batch->hashes.data())) {
       std::cerr << "GPU batch failed: " << gpu->error() << "\n";
