@@ -12,11 +12,15 @@
 #include <fstream>
 #include <iostream>
 #include <mutex>
+#include <memory>
 #include <random>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
+#include <cstring>
+
+#include <sodium.h>
 
 namespace {
 
@@ -25,6 +29,7 @@ constexpr size_t kPubKeySize = 32;
 constexpr size_t kHashSize = 32;
 constexpr size_t kPrivateKeySize = 64;
 constexpr size_t kOpenSshBlockSize = 8;
+constexpr size_t kPayloadSize = 51;
 
 size_t base64_no_pad(const uint8_t* data, size_t len, char* out) {
   static constexpr char kTable[] =
@@ -189,11 +194,13 @@ struct Options {
   size_t batch = 65536;
   size_t threads = 0;
   size_t pipeline = 3;
+  bool cpu_only = false;
 };
 
 void print_usage(const char* argv0) {
   std::cerr << "Usage: " << argv0
-            << " --pattern <regex> [--batch N] [--threads N] [--pipeline N]\n";
+            << " --pattern <regex> [--batch N] [--threads N] [--pipeline N]"
+            << " [--cpu-only]\n";
 }
 
 bool parse_args(int argc, char** argv, Options* out) {
@@ -211,6 +218,8 @@ bool parse_args(int argc, char** argv, Options* out) {
       out->threads = static_cast<size_t>(std::stoull(argv[++i]));
     } else if (arg == "--pipeline" && i + 1 < argc) {
       out->pipeline = static_cast<size_t>(std::stoull(argv[++i]));
+    } else if (arg == "--cpu-only") {
+      out->cpu_only = true;
     } else {
       return false;
     }
@@ -233,6 +242,28 @@ struct WorkItem {
   size_t end = 0;
 };
 
+void fill_payload_prefix(uint8_t* payload) {
+  payload[0] = 0;
+  payload[1] = 0;
+  payload[2] = 0;
+  payload[3] = 11;
+  payload[4] = 's';
+  payload[5] = 's';
+  payload[6] = 'h';
+  payload[7] = '-';
+  payload[8] = 'e';
+  payload[9] = 'd';
+  payload[10] = '2';
+  payload[11] = '5';
+  payload[12] = '5';
+  payload[13] = '1';
+  payload[14] = '9';
+  payload[15] = 0;
+  payload[16] = 0;
+  payload[17] = 0;
+  payload[18] = 32;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -246,21 +277,31 @@ int main(int argc, char** argv) {
     options.threads = std::max<size_t>(1, std::thread::hardware_concurrency());
   }
 
+  if (options.cpu_only) {
+    if (sodium_init() < 0) {
+      std::cerr << "libsodium init failed\n";
+      return 1;
+    }
+  }
+
   MatchRule rule(options.pattern);
   if (!rule.ok()) {
     std::cerr << "Invalid regex: " << rule.error() << "\n";
     return 1;
   }
 
-  vanity::GpuVanity gpu(options.batch);
-  if (!gpu.ok()) {
-    std::cerr << "GPU init failed: " << gpu.error() << "\n";
-    return 1;
+  std::unique_ptr<vanity::GpuVanity> gpu;
+  if (!options.cpu_only) {
+    gpu = std::make_unique<vanity::GpuVanity>(options.batch);
+    if (!gpu->ok()) {
+      std::cerr << "GPU init failed: " << gpu->error() << "\n";
+      return 1;
+    }
   }
 
-  std::ofstream log("out.log", std::ios::app | std::ios::binary);
+  std::ofstream log("keys.log", std::ios::app | std::ios::binary);
   if (!log) {
-    std::cerr << "Failed to open out.log for writing\n";
+    std::cerr << "Failed to open keys.log for writing\n";
     return 1;
   }
 
@@ -269,27 +310,29 @@ int main(int argc, char** argv) {
   std::atomic<bool> stop{false};
   std::mutex log_mutex;
 
-  if (options.pipeline == 0) {
-    options.pipeline = 1;
-  }
-
-  std::vector<Batch> batches(options.pipeline);
-  for (auto& batch : batches) {
-    batch.seeds.resize(options.batch * kSeedSize);
-    batch.pubkeys.resize(options.batch * kPubKeySize);
-    batch.hashes.resize(options.batch * kHashSize);
-  }
-
+  std::vector<std::unique_ptr<Batch>> batches;
   std::deque<Batch*> free_batches;
-  for (auto& batch : batches) {
-    free_batches.push_back(&batch);
-  }
   std::mutex free_mutex;
   std::condition_variable free_cv;
 
   std::deque<WorkItem> work_queue;
   std::mutex work_mutex;
   std::condition_variable work_cv;
+
+  if (!options.cpu_only) {
+    if (options.pipeline == 0) {
+      options.pipeline = 1;
+    }
+    batches.reserve(options.pipeline);
+    for (size_t i = 0; i < options.pipeline; ++i) {
+      auto batch = std::make_unique<Batch>();
+      batch->seeds.resize(options.batch * kSeedSize);
+      batch->pubkeys.resize(options.batch * kPubKeySize);
+      batch->hashes.resize(options.batch * kHashSize);
+      free_batches.push_back(batch.get());
+      batches.push_back(std::move(batch));
+    }
+  }
 
   std::thread stats([&]() {
     using namespace std::chrono_literals;
@@ -343,7 +386,7 @@ int main(int argc, char** argv) {
         log << "sha256_b64=" << fingerprint << "\n\n";
         log.flush();
         std::cout << "match: " << fingerprint
-                  << " (OpenSSH key written to out.log)\n";
+                  << " (OpenSSH key written to keys.log)\n";
       }
 
       if (item.batch->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
@@ -353,6 +396,54 @@ int main(int argc, char** argv) {
       }
     }
   };
+
+  if (options.cpu_only) {
+    std::vector<std::thread> cpu_workers;
+    cpu_workers.reserve(options.threads);
+    for (size_t t = 0; t < options.threads; ++t) {
+      cpu_workers.emplace_back([&]() {
+        uint8_t payload[kPayloadSize];
+        fill_payload_prefix(payload);
+        std::array<uint8_t, kSeedSize> seed{};
+        std::array<uint8_t, kPubKeySize> pub{};
+        std::array<uint8_t, kPrivateKeySize> priv{};
+        std::array<uint8_t, kHashSize> hash{};
+        char b64[64];
+
+        while (!stop.load()) {
+          randombytes_buf(seed.data(), seed.size());
+          crypto_sign_seed_keypair(pub.data(), priv.data(), seed.data());
+          std::memcpy(payload + 19, pub.data(), kPubKeySize);
+          crypto_hash_sha256(hash.data(), payload, kPayloadSize);
+
+          size_t b64_len = base64_no_pad(hash.data(), kHashSize, b64);
+          std::string_view fingerprint(b64, b64_len);
+          if (rule.match(fingerprint)) {
+            total_matches.fetch_add(1, std::memory_order_relaxed);
+            std::string openssh_key = build_openssh_private_key(seed.data(), pub.data(),
+                                                               fingerprint);
+            std::string openssh_pub = build_openssh_public_key_line(pub.data(),
+                                                                    fingerprint);
+            std::lock_guard<std::mutex> guard(log_mutex);
+            log << openssh_key;
+            log << openssh_pub << "\n\n";
+            log << "sha256_b64=" << fingerprint << "\n\n";
+            log.flush();
+            std::cout << "match: " << fingerprint
+                      << " (OpenSSH key written to keys.log)\n";
+          }
+
+          total_checked.fetch_add(1, std::memory_order_relaxed);
+        }
+      });
+    }
+
+    for (auto& thread : cpu_workers) {
+      thread.join();
+    }
+    stats.join();
+    return 0;
+  }
 
   std::vector<std::thread> workers;
   workers.reserve(options.threads);
@@ -372,9 +463,9 @@ int main(int argc, char** argv) {
       free_batches.pop_front();
     }
 
-    if (!gpu.generate(options.batch, batch->seeds.data(), batch->pubkeys.data(),
-                      batch->hashes.data())) {
-      std::cerr << "GPU batch failed: " << gpu.error() << "\n";
+    if (!gpu->generate(options.batch, batch->seeds.data(), batch->pubkeys.data(),
+                       batch->hashes.data())) {
+      std::cerr << "GPU batch failed: " << gpu->error() << "\n";
       stop.store(true);
       work_cv.notify_all();
       free_cv.notify_all();
